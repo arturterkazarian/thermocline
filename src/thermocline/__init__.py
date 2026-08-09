@@ -1,5 +1,6 @@
 """Thermocline: a memory-efficient, tiered read-through cache for read-heavy services."""
 
+from thermocline.serializer import JsonSerializer, MsgpackSerializer, Serializer
 from thermocline.source import (
     CacheSource,
     SupportsDelta,
@@ -10,6 +11,9 @@ from thermocline.source import (
 
 __all__ = [
     "CacheSource",
+    "JsonSerializer",
+    "MsgpackSerializer",
+    "Serializer",
     "SupportsDelta",
     "SupportsHashProbe",
     "SupportsSnapshot",
