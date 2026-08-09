@@ -763,6 +763,7 @@ sqlalchemy = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "msgpack" },
     { name = "mypy" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -780,6 +781,7 @@ provides-extras = ["sqlalchemy", "httpx", "pydantic", "msgpack"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "msgpack", specifier = ">=1.0" },
     { name = "mypy", specifier = ">=1.11" },
     { name = "pytest", specifier = ">=8" },
     { name = "pytest-asyncio", specifier = ">=0.24" },
