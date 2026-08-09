@@ -78,7 +78,17 @@ select = [
     "B",        # bugbear
     "SIM",      # simplifications
     "RUF",      # ruff-specific rules
+    "D",        # pydocstyle
 ]
+ignore = [
+    "D107",     # __init__ args belong in the class docstring (Google style)
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D101", "D102", "D103"]  # test names speak for themselves
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
