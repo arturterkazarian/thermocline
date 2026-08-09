@@ -1,5 +1,6 @@
 """Thermocline: a memory-efficient, tiered read-through cache for read-heavy services."""
 
+from thermocline.cache import Thermocline
 from thermocline.errors import MisconfiguredCacheError, ThermoclineError
 from thermocline.eviction import EvictionPolicy, LruEviction
 from thermocline.serializer import JsonSerializer, MsgpackSerializer, Serializer
@@ -23,5 +24,6 @@ __all__ = [
     "SupportsHashProbe",
     "SupportsSnapshot",
     "SyncBatch",
+    "Thermocline",
     "ThermoclineError",
 ]
