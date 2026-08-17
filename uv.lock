@@ -7,6 +7,15 @@ resolution-markers = [
 ]
 
 [[package]]
+name = "aiosql"
+version = "15.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/dc/31/97ebbd15ead5cf9c3951d6e8dfafc5e7b7e8c52148768cb7b95cd443fc8a/aiosql-15.0.tar.gz", hash = "sha256:744939fdfb3e0c36d88ccaf1f73cb1cf8cc38e7052666b884502db99aff8f3fd", size = 77429, upload-time = "2026-01-04T19:14:41.239Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/28/a4/67a07ed3e827a50671d7248624c1d3666243c580b0b0567c62d12e1c6de7/aiosql-15.0-py3-none-any.whl", hash = "sha256:ba659870914258790da77a999902c0b7712d58754ca2bd335cf2be34a8433b42", size = 26145, upload-time = "2026-01-04T19:14:39.792Z" },
+]
+
+[[package]]
 name = "aiosqlite"
 version = "0.22.1"
 source = { registry = "https://pypi.org/simple" }
@@ -778,6 +787,9 @@ version = "0.1.0"
 source = { editable = "." }
 
 [package.optional-dependencies]
+aiosql = [
+    { name = "aiosql" },
+]
 httpx = [
     { name = "httpx" },
 ]
@@ -793,6 +805,7 @@ sqlalchemy = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "aiosql" },
     { name = "aiosqlite" },
     { name = "msgpack" },
     { name = "mypy" },
@@ -805,15 +818,17 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aiosql", marker = "extra == 'aiosql'", specifier = ">=9.0" },
     { name = "httpx", marker = "extra == 'httpx'", specifier = ">=0.27" },
     { name = "msgpack", marker = "extra == 'msgpack'", specifier = ">=1.0" },
     { name = "pydantic", marker = "extra == 'pydantic'", specifier = ">=2.0" },
     { name = "sqlalchemy", extras = ["asyncio"], marker = "extra == 'sqlalchemy'", specifier = ">=2.0" },
 ]
-provides-extras = ["sqlalchemy", "httpx", "pydantic", "msgpack"]
+provides-extras = ["sqlalchemy", "aiosql", "httpx", "pydantic", "msgpack"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "aiosql", specifier = ">=9.0" },
     { name = "aiosqlite", specifier = ">=0.20" },
     { name = "msgpack", specifier = ">=1.0" },
     { name = "mypy", specifier = ">=1.11" },
