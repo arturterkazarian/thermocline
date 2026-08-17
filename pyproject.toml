@@ -97,7 +97,8 @@ ignore = [
 convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["D101", "D102", "D103", "D106"]  # test names speak for themselves
+"tests/*" = ["D101", "D102", "D103", "D106"]
+"benchmarks/*" = ["D101", "D102", "D103", "D106"]  # test names speak for themselves
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
