@@ -1,0 +1,18 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: bench
+      POSTGRES_PASSWORD: bench
+      POSTGRES_DB: bench
+    ports:
+      - "5433:5432"
+    tmpfs:
+      - /var/lib/postgresql/data  # benchmarks want speed, not durability
+
+  api:
+    build: ./server
+    ports:
+      - "8077:8077"
+    volumes:
+      - ./server/data:/data:ro
