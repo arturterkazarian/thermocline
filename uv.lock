@@ -807,6 +807,7 @@ sqlalchemy = [
 dev = [
     { name = "aiosql" },
     { name = "aiosqlite" },
+    { name = "httpx" },
     { name = "msgpack" },
     { name = "mypy" },
     { name = "pydantic" },
@@ -830,6 +831,7 @@ provides-extras = ["sqlalchemy", "aiosql", "httpx", "pydantic", "msgpack"]
 dev = [
     { name = "aiosql", specifier = ">=9.0" },
     { name = "aiosqlite", specifier = ">=0.20" },
+    { name = "httpx", specifier = ">=0.27" },
     { name = "msgpack", specifier = ">=1.0" },
     { name = "mypy", specifier = ">=1.11" },
     { name = "pydantic", specifier = ">=2.0" },
