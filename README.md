@@ -1,5 +1,9 @@
 # thermocline
 
+[![CI](https://github.com/arturterkazarian/thermocline/actions/workflows/ci.yml/badge.svg)](https://github.com/arturterkazarian/thermocline/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.10%E2%80%933.14-blue)](https://github.com/arturterkazarian/thermocline/blob/main/pyproject.toml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
+
 A memory-efficient, tiered read-through cache for read-heavy Python services — hot objects over a compact cold tier, backed by any source.
 
 Named after the ocean layer that separates warm surface water from the cold depths — the same boundary this library draws between hot deserialized objects and their compact cold copies.
