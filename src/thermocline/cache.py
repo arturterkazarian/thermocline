@@ -29,6 +29,7 @@ import contextlib
 import logging
 import math
 import time
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import timedelta
@@ -52,6 +53,8 @@ T = TypeVar("T")
 logger = logging.getLogger("thermocline")
 
 _AUTO_STALENESS_WITHOUT_PROBE = 300.0
+_ENTRY_OVERHEAD = 200  # rough per-envelope bookkeeping cost, bytes
+_TOMBSTONE_OVERHEAD = 100  # rough per-tombstone bookkeeping cost, bytes
 
 
 def _as_seconds(value: float | timedelta, name: str) -> float:
@@ -63,10 +66,10 @@ def _as_seconds(value: float | timedelta, name: str) -> float:
 
 @dataclass(slots=True)
 class _Envelope:
-    """One cold-tier entry; ``hash`` and ``payload`` are both None for a tombstone."""
+    """One live cold-tier entry; absences are tracked separately."""
 
-    hash: str | None
-    payload: bytes | None
+    hash: str
+    payload: bytes
     checked_at: float
 
 
@@ -99,6 +102,17 @@ class Thermocline(Generic[K, T]):
             without background sync.
         sync_interval: Seconds between background sync cycles.
         eviction: Hot-tier eviction policy; LRU by default.
+        memory_limit: Byte budget for the cold tier — payload bytes plus a
+            small per-entry overhead; the measurable part of the cache. On
+            overflow the cache evicts tombstones first, then the least
+            recently used envelopes; an envelope with a hot copy goes last
+            and takes the hot copy with it. ``None`` (default) means
+            unbounded. Lazy mode only: with background sync the cold tier
+            holds the full dataset by design.
+        negative_capacity: How many confirmed absences (tombstones) to
+            remember. ``0`` (default) disables negative caching: every miss
+            goes to the source. Lazy mode only — a synced cold tier is
+            authoritative for absence and needs no tombstones.
 
     Raises:
         MisconfiguredCacheError: If a requested mode needs a capability the
@@ -116,6 +130,8 @@ class Thermocline(Generic[K, T]):
         sync: Literal["auto", "delta", "snapshot"] | None = "auto",
         sync_interval: float | timedelta = 60.0,
         eviction: EvictionPolicy[K] | None = None,
+        memory_limit: int | None = None,
+        negative_capacity: int = 0,
     ) -> None:
         if hot_capacity < 0:
             raise MisconfiguredCacheError("hot_capacity must be non-negative")
@@ -171,8 +187,29 @@ class Thermocline(Generic[K, T]):
         if self._sync_mode is not None and self._sync_interval <= 0:
             raise MisconfiguredCacheError("sync_interval must be positive")
 
+        if negative_capacity < 0:
+            raise MisconfiguredCacheError("negative_capacity must be non-negative")
+        if memory_limit is not None and memory_limit <= 0:
+            raise MisconfiguredCacheError("memory_limit must be positive")
+        if self._sync_mode is not None:
+            if memory_limit is not None:
+                raise MisconfiguredCacheError(
+                    "memory_limit applies to the lazy mode only: with background sync "
+                    "the cold tier holds the full dataset by design"
+                )
+            if negative_capacity:
+                raise MisconfiguredCacheError(
+                    "negative_capacity applies to the lazy mode only: a synced cold "
+                    "tier is authoritative for absence and needs no tombstones"
+                )
+        self._memory_limit = memory_limit
+        self._negative_capacity = negative_capacity
+
         self._evictor: EvictionPolicy[K] = eviction if eviction is not None else LruEviction()
-        self._cold: dict[K, _Envelope] = {}
+        self._cold: OrderedDict[K, _Envelope] = OrderedDict()
+        self._tombstones: OrderedDict[K, float] = OrderedDict()
+        self._cold_bytes = 0
+        self._last_sync: float | None = None
         self._hot: dict[K, T] = {}
         self._pinned: set[K] = set()
         self._cursor: str | None = None
@@ -205,6 +242,11 @@ class Thermocline(Generic[K, T]):
     def stale_grace(self) -> float:
         """Extra staleness budget allowed while the source is unreachable."""
         return self._stale_grace
+
+    @property
+    def memory_bytes(self) -> int:
+        """Estimated cold-tier footprint: payload bytes plus bookkeeping overhead."""
+        return self._cold_bytes
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -265,7 +307,7 @@ class Thermocline(Generic[K, T]):
         )
         envelope = self._cold.get(key)
         if envelope is None:
-            return await self._load_miss(key)
+            return await self._absent(key, limit)
         if time.monotonic() - envelope.checked_at <= limit:
             return self._serve(key, envelope)
         return await self._revalidate(key, envelope, limit)
@@ -302,6 +344,7 @@ class Thermocline(Generic[K, T]):
             await self._sync_delta()
         else:
             await self._sync_snapshot()
+        self._last_sync = time.monotonic()
 
     async def _sync_loop(self) -> None:
         while True:
@@ -328,7 +371,8 @@ class Thermocline(Generic[K, T]):
     async def _sync_snapshot(self) -> None:
         source = cast(SupportsSnapshot[T], self._source)
         old = self._cold
-        fresh: dict[K, _Envelope] = {}
+        fresh: OrderedDict[K, _Envelope] = OrderedDict()
+        fresh_bytes = 0
         async for obj in source.load_all():
             key = self._source.key_of(obj)
             new_hash = self._source.hash_of(obj)
@@ -338,7 +382,9 @@ class Thermocline(Generic[K, T]):
                 fresh[key] = previous
             else:
                 fresh[key] = _Envelope(new_hash, self._serializer.encode(obj), time.monotonic())
+            fresh_bytes += len(fresh[key].payload) + _ENTRY_OVERHEAD
         self._cold = fresh  # atomic swap: readers never see a half-built tier
+        self._cold_bytes = fresh_bytes
         for key in list(self._hot):
             if fresh.get(key) is not old.get(key):
                 self._drop_hot(key)
@@ -350,14 +396,17 @@ class Thermocline(Generic[K, T]):
         if envelope is not None and envelope.hash == new_hash:
             envelope.checked_at = time.monotonic()
             return
-        self._cold[key] = _Envelope(new_hash, self._serializer.encode(obj), time.monotonic())
+        if envelope is not None:
+            self._cold_bytes -= len(envelope.payload) + _ENTRY_OVERHEAD
+        payload = self._serializer.encode(obj)
+        self._cold[key] = _Envelope(new_hash, payload, time.monotonic())
+        self._cold_bytes += len(payload) + _ENTRY_OVERHEAD
         self._drop_hot(key)
 
     # -- internals ---------------------------------------------------------
 
     def _serve(self, key: K, envelope: _Envelope) -> T | None:
-        if envelope.payload is None:
-            return None
+        self._cold.move_to_end(key)
         obj = self._hot.get(key)
         if obj is not None:
             if key not in self._pinned:
@@ -393,21 +442,107 @@ class Thermocline(Generic[K, T]):
 
     def _delete_entry(self, key: K) -> None:
         self._drop_hot(key)
-        self._cold[key] = _Envelope(None, None, time.monotonic())
+        self._evict_envelope(key)
+        self._remember_absent(key)
+
+    def _evict_envelope(self, key: K) -> None:
+        envelope = self._cold.pop(key, None)
+        if envelope is not None:
+            self._cold_bytes -= len(envelope.payload) + _ENTRY_OVERHEAD
+
+    def _remember_absent(self, key: K) -> None:
+        if self._sync_mode is not None or self._negative_capacity == 0:
+            return
+        if key not in self._tombstones:
+            self._cold_bytes += _TOMBSTONE_OVERHEAD
+        self._tombstones[key] = time.monotonic()
+        self._tombstones.move_to_end(key)
+        while len(self._tombstones) > self._negative_capacity:
+            self._tombstones.popitem(last=False)
+            self._cold_bytes -= _TOMBSTONE_OVERHEAD
+        self._shrink()
+
+    def _drop_tombstone(self, key: K) -> None:
+        if self._tombstones.pop(key, None) is not None:
+            self._cold_bytes -= _TOMBSTONE_OVERHEAD
+
+    def _shrink(self) -> None:
+        """Enforce memory_limit: tombstones first, then LRU envelopes."""
+        if self._memory_limit is None:
+            return
+        while self._cold_bytes > self._memory_limit:
+            if self._tombstones:
+                self._tombstones.popitem(last=False)
+                self._cold_bytes -= _TOMBSTONE_OVERHEAD
+                continue
+            victim = next((k for k in self._cold if k not in self._hot), None)
+            if victim is None:
+                victim = next(iter(self._cold), None)
+                if victim is None:
+                    return
+                self._drop_hot(victim)  # the envelope goes: the hot copy cannot stay
+            self._evict_envelope(victim)
+
+    async def _absent(self, key: K, limit: float) -> T | None:
+        if self._sync_mode is not None:
+            # a complete cold tier is authoritative: absence is as fresh as the last sync
+            if self._last_sync is not None and time.monotonic() - self._last_sync <= limit:
+                return None
+            return await self._load_miss(key)
+        checked_at = self._tombstones.get(key)
+        if checked_at is None:
+            return await self._load_miss(key)
+        if time.monotonic() - checked_at <= limit:
+            self._tombstones.move_to_end(key)
+            return None
+        return await self._revalidate_absent(key, checked_at, limit)
+
+    async def _revalidate_absent(self, key: K, checked_at: float, limit: float) -> T | None:
+        if self._probe is not None:
+            try:
+                current = await self._probe(key)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if time.monotonic() - checked_at <= limit + self._stale_grace:
+                    logger.debug("serving stale absence %r: probe failed within grace", key)
+                    return None
+                raise
+            if current is None:
+                self._remember_absent(key)
+                return None
+            return await self._load_miss(key)  # the object came into existence
+        try:
+            obj = await self._source.get(key)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if time.monotonic() - checked_at <= limit + self._stale_grace:
+                logger.debug("serving stale absence %r: reload failed within grace", key)
+                return None
+            raise
+        if obj is None:
+            self._remember_absent(key)
+            return None
+        self._store(key, obj)
+        return obj
 
     async def _load_miss(self, key: K) -> T | None:
         obj = await self._source.get(key)  # no cached copy: errors propagate
         if obj is None:
-            self._cold[key] = _Envelope(None, None, time.monotonic())
+            self._remember_absent(key)
             return None
         self._store(key, obj)
         return obj
 
     def _store(self, key: K, obj: T) -> None:
-        self._cold[key] = _Envelope(
-            self._source.hash_of(obj), self._serializer.encode(obj), time.monotonic()
-        )
-        self._admit(key, obj)
+        self._drop_tombstone(key)
+        self._evict_envelope(key)  # replacing: release the old payload's bytes
+        payload = self._serializer.encode(obj)
+        self._cold[key] = _Envelope(self._source.hash_of(obj), payload, time.monotonic())
+        self._cold_bytes += len(payload) + _ENTRY_OVERHEAD
+        self._admit(key, obj)  # admit first: shrink must see the entry as hot
+        self._shrink()
 
     def _within_grace(self, envelope: _Envelope, limit: float) -> bool:
         return time.monotonic() - envelope.checked_at <= limit + self._stale_grace

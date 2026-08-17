@@ -213,7 +213,7 @@ await cache.get(key, max_staleness=0)  # this read must be exact
 | `"snapshot"` | `SupportsSnapshot` | Periodically re-stream the full dataset, atomically swap the cold tier |
 | `None` | — | Lazy only: the cache fills as keys are read |
 
-`sync="auto"` prefers delta, falls back to snapshot, and refuses a source that supports neither — pass `None` explicitly for a lazy-only cache. `start()` performs the initial load, so after it returns the cold tier holds the full dataset. Deletions arrive from sync as keys and become tombstones, so the cache also remembers what *does not* exist and answers `None` without touching the source.
+`sync="auto"` prefers delta, falls back to snapshot, and refuses a source that supports neither — pass `None` explicitly for a lazy-only cache. `start()` performs the initial load, so after it returns the cold tier holds the full dataset — which makes it **authoritative for absence**: a miss answers `None` straight from memory, as fresh as the last sync, without touching the source.
 
 <img src="docs/assets/06-background-sync.gif" alt="Background delta sync: a task pulls only the changed rows every interval" width="400">
 
@@ -231,6 +231,23 @@ Pinned keys are never evicted, but they consume the hot budget:
 cache.pin(hot_key)  # e.g. today's featured product
 cache.unpin(hot_key)
 ```
+
+### Bounding memory in lazy mode
+
+Without background sync the cold tier fills on demand, so it gets its own dials:
+
+```python
+cache = Thermocline(
+    source,
+    serializer,
+    sync=None,
+    hot_capacity=10_000,  # live objects, counted
+    memory_limit=256_000_000,  # cold-tier bytes, measured exactly
+    negative_capacity=10_000,  # confirmed absences to remember (default 0: off)
+)
+```
+
+`memory_limit` bounds what is honestly measurable — the compact payloads. On overflow the cache evicts tombstones first, then the least recently used envelopes; an envelope with a hot copy goes last and takes it along. `negative_capacity` opts into negative caching: absences obey the same freshness rules as objects, and a bounded budget means a scan of random keys cannot grow memory without limit. Both dials are lazy-mode only — a synced cold tier holds the full dataset by design and needs neither.
 
 ## Design principles
 

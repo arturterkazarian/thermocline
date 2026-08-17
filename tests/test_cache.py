@@ -142,9 +142,16 @@ class TestLazyReads:
         assert await cache.get(1) == Item(1, "a")
         assert source.get_calls == 1
 
-    async def test_absence_is_cached(self) -> None:
+    async def test_absence_not_cached_by_default(self) -> None:
         source = BareSource()
         cache = lazy_cache(source, max_staleness=math.inf)
+        assert await cache.get(42) is None
+        assert await cache.get(42) is None
+        assert source.get_calls == 2  # negative caching is opt-in
+
+    async def test_absence_cached_when_enabled(self) -> None:
+        source = BareSource()
+        cache = lazy_cache(source, max_staleness=math.inf, negative_capacity=10)
         assert await cache.get(42) is None
         assert await cache.get(42) is None
         assert source.get_calls == 1
@@ -315,8 +322,8 @@ class TestSnapshotSync:
             source.items[1] = Item(1, "a2")
             await cache.sync_now()
             assert await cache.get(1) == Item(1, "a2")
-            assert await cache.get(2) is None  # gone from cold: miss goes to source
-        assert source.get_calls == 1
+            assert await cache.get(2) is None  # complete cold tier is authoritative
+        assert source.get_calls == 0
 
     async def test_lifecycle_is_reentrant_and_idempotent(self) -> None:
         source = SnapshotSource({1: Item(1, "a")})
@@ -325,3 +332,102 @@ class TestSnapshotSync:
         await cache.start()  # idempotent
         await cache.close()
         await cache.close()  # idempotent
+
+
+class TestNegativeCache:
+    async def test_tombstones_are_bounded(self) -> None:
+        source = BareSource()
+        cache = lazy_cache(source, max_staleness=math.inf, negative_capacity=5)
+        for key in range(100, 120):
+            await cache.get(key)
+        assert len(cache._tombstones) == 5
+
+    async def test_stale_absence_revalidated_by_probe(self) -> None:
+        source = ProbeSource()
+        cache = lazy_cache(source, negative_capacity=10)  # auto staleness = 0
+        assert await cache.get(42) is None
+        assert await cache.get(42) is None
+        assert source.get_calls == 1  # the second check was a probe
+        assert source.probe_calls == 1
+
+    async def test_object_coming_into_existence_is_loaded(self) -> None:
+        source = ProbeSource()
+        cache = lazy_cache(source, negative_capacity=10)
+        assert await cache.get(1) is None
+        source.items[1] = Item(1, "born")
+        assert await cache.get(1) == Item(1, "born")
+
+    async def test_absence_grace_serves_none_on_probe_failure(self) -> None:
+        source = ProbeSource()
+        cache = lazy_cache(source, negative_capacity=10, stale_grace=60)
+        assert await cache.get(42) is None
+        source.probe_error = ConnectionError("db is down")
+        assert await cache.get(42) is None  # stale absence within grace
+
+
+class TestMemoryLimit:
+    async def test_memory_stays_under_limit(self) -> None:
+        items = {i: Item(i, "x" * 50) for i in range(1, 21)}
+        source = BareSource(items)
+        cache = lazy_cache(source, max_staleness=math.inf, memory_limit=1500)
+        for key in items:
+            await cache.get(key)
+        assert cache.memory_bytes <= 1500
+        assert len(cache._cold) < len(items)
+
+    async def test_lru_envelope_evicted_and_refetched(self) -> None:
+        items = {i: Item(i, "x" * 50) for i in range(1, 11)}
+        source = BareSource(items)
+        cache = lazy_cache(source, max_staleness=math.inf, memory_limit=800, hot_capacity=0)
+        for key in items:
+            await cache.get(key)
+        calls = source.get_calls
+        assert await cache.get(1) == items[1]  # oldest key: evicted, refetched
+        assert source.get_calls == calls + 1
+
+    async def test_tombstones_evicted_before_envelopes(self) -> None:
+        items = {i: Item(i, "x" * 50) for i in range(1, 4)}
+        source = BareSource(items)
+        cache = lazy_cache(source, max_staleness=math.inf, memory_limit=900, negative_capacity=10)
+        await cache.get(404)
+        await cache.get(405)
+        assert len(cache._tombstones) == 2
+        for key in items:
+            await cache.get(key)
+        assert len(cache._tombstones) == 0  # tombstones paid for the envelopes
+        assert len(cache._cold) == 3
+
+    async def test_hot_copy_falls_with_its_envelope(self) -> None:
+        items = {i: Item(i, "x" * 50) for i in range(1, 4)}
+        source = BareSource(items)
+        cache = lazy_cache(source, max_staleness=math.inf, memory_limit=300)
+        for key in items:
+            await cache.get(key)  # every entry is hot: rung 3 must fire
+        assert cache.memory_bytes <= 300
+        assert set(cache._hot) == set(cache._cold)  # inclusivity survived
+
+
+class TestAuthoritativeAbsence:
+    async def test_synced_cache_answers_none_from_memory(self) -> None:
+        source = DeltaSource()
+        source.batches = [SyncBatch(changed=[Item(1, "a")], deleted=[], cursor="c1")]
+        cache = Thermocline(source, make_serializer(), hot_capacity=10, max_staleness=math.inf)
+        async with cache:
+            assert await cache.get(404) is None
+        assert source.get_calls == 0
+
+    async def test_strict_freshness_still_asks_the_source(self) -> None:
+        source = DeltaSource()
+        source.batches = [SyncBatch(changed=[Item(1, "a")], deleted=[], cursor="c1")]
+        cache = Thermocline(source, make_serializer(), hot_capacity=10, max_staleness=0)
+        async with cache:
+            assert await cache.get(404) is None
+        assert source.get_calls == 1
+
+    def test_memory_limit_rejected_with_sync(self) -> None:
+        with pytest.raises(MisconfiguredCacheError, match="memory_limit"):
+            Thermocline(DeltaSource(), make_serializer(), hot_capacity=10, memory_limit=1000)
+
+    def test_negative_capacity_rejected_with_sync(self) -> None:
+        with pytest.raises(MisconfiguredCacheError, match="negative_capacity"):
+            Thermocline(DeltaSource(), make_serializer(), hot_capacity=10, negative_capacity=5)
