@@ -42,6 +42,7 @@ dependencies = []
 [project.optional-dependencies]
 sqlalchemy = ["sqlalchemy[asyncio]>=2.0"]
 aiosql = ["aiosql>=9.0"]
+tortoise = ["tortoise-orm>=0.21"]
 httpx = ["httpx>=0.27"]
 pydantic = ["pydantic>=2.0"]
 msgpack = ["msgpack>=1.0"]
@@ -69,6 +70,7 @@ dev = [
     "aiosqlite>=0.20",
     "aiosql>=9.0",
     "httpx>=0.27",
+    "tortoise-orm>=0.21",
 ]
 
 [tool.ruff]
@@ -95,7 +97,7 @@ ignore = [
 convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["D101", "D102", "D103"]  # test names speak for themselves
+"tests/*" = ["D101", "D102", "D103", "D106"]  # test names speak for themselves
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
