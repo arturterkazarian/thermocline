@@ -63,6 +63,117 @@ The core contract is three methods; everything else is an optional capability th
 
 Capabilities are structural — implement the method and the cache detects it. The requested mode is validated against the source's capabilities at construction: nothing degrades silently.
 
+## Adapters
+
+Ready-made sources for the popular backends, each behind its own extra. All follow one rule: **what you declared is what you get** — every declared column, field, query, or URL unlocks the matching capability, and nothing is guessed from naming conventions.
+
+| Adapter | Extra | Declare capabilities with |
+|---|---|---|
+| `SQLAlchemySource` | `thermocline[sqlalchemy]` | Mapped columns (`hash=Model.content_hash`) |
+| `TortoiseSource` | `thermocline[tortoise]` | Field names, validated at startup |
+| `AiosqlSource` | `thermocline[aiosql]` | Named queries in your `.sql` file |
+| `HttpxSource` | `thermocline[httpx]` | Endpoint URLs |
+| `PydanticSerializer` | `thermocline[pydantic]` | — (cold-tier codec, pairs with any source) |
+
+### SQLAlchemy
+
+Columns are declared as columns, not strings — a typo is caught by your IDE, not in production. The key defaults to the mapped primary key.
+
+```python
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from thermocline.adapters.sqlalchemy import SQLAlchemySource
+
+engine = create_async_engine("postgresql+asyncpg://app@db/catalog")
+source = SQLAlchemySource(
+    async_sessionmaker(engine, expire_on_commit=False),
+    model=ProductRow,
+    hash=ProductRow.content_hash,  # unlocks cheap freshness probes
+    updated_at=ProductRow.updated_at,  # unlocks incremental delta sync
+    deleted_at=ProductRow.deleted_at,  # soft deletes flow into the delta
+)
+```
+
+### Tortoise ORM
+
+Same pattern with field names; every name is validated against the model at construction. The key defaults to the model's primary key.
+
+```python
+from thermocline.adapters.tortoise import TortoiseSource
+
+source = TortoiseSource(
+    Product,
+    hash_field="content_hash",
+    updated_at_field="updated_at",
+    deleted_at_field="deleted_at",
+)
+```
+
+### aiosql — raw SQL
+
+The queries you wrote are the capabilities you get; the SQL — including pagination and soft-delete filtering — belongs entirely to you. `get_one` is required, the rest are optional.
+
+```sql
+-- name: get_one(key)^
+SELECT id, title, content_hash FROM products WHERE id = :key AND deleted_at IS NULL;
+
+-- name: get_hash(key)$
+SELECT content_hash FROM products WHERE id = :key AND deleted_at IS NULL;
+
+-- name: load_changed(updated_at, key, limit, offset)
+SELECT id, title, content_hash, updated_at, deleted_at FROM products
+WHERE :updated_at IS NULL OR (updated_at, id) > (:updated_at, :key)
+ORDER BY updated_at, id LIMIT :limit OFFSET :offset;
+```
+
+```python
+import aiosql
+from thermocline.adapters.aiosql import AiosqlSource
+
+queries = aiosql.from_path("products.sql", "asyncpg")
+source = AiosqlSource(queries, pool, hash_field="content_hash")
+```
+
+### httpx — any REST API
+
+The URLs you passed are the capabilities you get. Your `httpx.AsyncClient` owns auth, base URL, and retries; `404` means "does not exist", any other error propagates untouched.
+
+```python
+import httpx
+from thermocline.adapters.httpx import HttpxSource
+
+client = httpx.AsyncClient(base_url="https://catalog.internal", auth=token_auth)
+source = HttpxSource(
+    client,
+    get_url="/products/{key}",
+    hash_url="/products/{key}/hash",
+    changed_url="/products/changed",
+    hash_field="content_hash",
+    items_field="items",
+)
+```
+
+### Putting it together
+
+The adapters compose: SQLAlchemy rows on the bottom, Pydantic models for your code, MessagePack in the cold tier.
+
+```python
+from thermocline import Thermocline
+from thermocline.adapters.pydantic import PydanticSerializer
+
+source = SQLAlchemySource(
+    sessions,
+    model=ProductRow,
+    hash=ProductRow.content_hash,
+    updated_at=ProductRow.updated_at,
+    deleted_at=ProductRow.deleted_at,
+    to_obj=lambda row: Product.model_validate(row, from_attributes=True),
+)
+cache = Thermocline(source, PydanticSerializer(Product), hot_capacity=10_000)
+
+async with cache:  # bootstrap: the cold tier fills once
+    product = await cache.get(42)  # then reads live above the thermocline
+```
+
 ## Freshness: one dial
 
 `max_staleness` is how long a copy may be served without checking, in seconds. The checking mechanism is picked automatically: a cheap hash probe when the source supports it, a full reload otherwise.
@@ -137,11 +248,11 @@ Not yet published to PyPI. From source:
 pip install "thermocline @ git+https://github.com/arturterkazarian/thermocline"
 ```
 
-Optional extras: `thermocline[msgpack]` for the compact cold-tier codec, `thermocline[sqlalchemy]`, `thermocline[httpx]`, `thermocline[pydantic]` for upcoming adapters.
+Optional extras: `thermocline[msgpack]` for the compact cold-tier codec; `thermocline[sqlalchemy]`, `thermocline[tortoise]`, `thermocline[aiosql]`, `thermocline[httpx]`, `thermocline[pydantic]` for the adapters.
 
 ## Status
 
-Alpha. The source contract, serializers, and the two-tier cache facade are implemented and tested; adapters (SQLAlchemy, httpx, Pydantic), metrics, and batch reads are on the roadmap.
+Alpha. The source contract, serializers, the two-tier cache facade, and five adapters (SQLAlchemy, Tortoise ORM, aiosql, httpx, Pydantic) are implemented and tested across Python 3.10–3.14. On the roadmap: metrics and observability, batch reads (`get_many`), a raw-payload fast path for bulk sync, and push-based invalidation.
 
 ## License
 
