@@ -280,8 +280,7 @@ def plot(sampler: MemorySampler, path: pathlib.Path) -> bool:
     for t, label in sampler.marks:
         x = t - t0
         ax.axvline(x, color="#13303A", alpha=0.25, linewidth=0.8)
-        ax.text(x, top, " " + label, rotation=90, va="top", ha="left", fontsize=7,
-                color="#13303A")
+        ax.text(x, top, " " + label, rotation=90, va="top", ha="left", fontsize=7, color="#13303A")
     ax.set_xlabel("seconds")
     ax.set_ylabel("RSS, MB")
     ax.set_title("thermocline benchmark: process memory over time")
