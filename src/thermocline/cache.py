@@ -19,6 +19,10 @@ Availability is a second, separate dial: ``stale_grace`` is the extra
 staleness budget allowed when the source is unreachable. The default of
 ``0`` propagates the failure.
 
+Source-touching paths are single-flight: however many readers miss or
+revalidate the same key concurrently, exactly one operation reaches the
+source and everyone shares its outcome — the cache never amplifies load.
+
 A cache instance belongs to one event loop; no method is thread-safe.
 """
 
@@ -79,6 +83,7 @@ class _Counters:
     cold_hits: int = 0
     source_loads: int = 0
     absent_served: int = 0
+    coalesced: int = 0
     probes: int = 0
     stale_served: int = 0
     sync_runs: int = 0
@@ -91,7 +96,8 @@ class CacheStats:
 
     Counters are cumulative since the cache was constructed; every ``get``
     that returns increments exactly one of ``hot_hits`` / ``cold_hits`` /
-    ``absent_served`` / ``source_loads`` by its final outcome.
+    ``absent_served`` / ``source_loads`` / ``coalesced`` by its final
+    outcome.
     ``stale_served`` and ``probes`` count *additionally*: a probe precedes
     an outcome, and a stale serve under ``stale_grace`` is still a hot or
     cold hit — watching ``stale_served`` grow is how source degradation
@@ -103,6 +109,9 @@ class CacheStats:
         source_loads: Successful full loads from the source.
         absent_served: ``None`` answered from memory — a tombstone or an
             authoritative synced cold tier.
+        coalesced: Reads answered by joining another read's in-flight
+            source operation (single-flight). Growth here is the stampede
+            protection working.
         probes: Freshness probes sent to the source.
         stale_served: Reads served beyond ``max_staleness`` because the
             source was unreachable within ``stale_grace``.
@@ -121,6 +130,7 @@ class CacheStats:
     cold_hits: int
     source_loads: int
     absent_served: int
+    coalesced: int
     probes: int
     stale_served: int
     sync_runs: int
@@ -135,12 +145,14 @@ class CacheStats:
     @property
     def reads(self) -> int:
         """Total reads that returned, whatever the outcome."""
-        return self.hot_hits + self.cold_hits + self.absent_served + self.source_loads
+        return (
+            self.hot_hits + self.cold_hits + self.absent_served + self.source_loads + self.coalesced
+        )
 
     @property
     def hit_rate(self) -> float:
-        """Share of reads answered from memory; ``0.0`` before any reads."""
-        served = self.hot_hits + self.cold_hits + self.absent_served
+        """Share of reads that did not pay their own source round trip."""
+        served = self.hot_hits + self.cold_hits + self.absent_served + self.coalesced
         return served / self.reads if self.reads else 0.0
 
 
@@ -286,6 +298,7 @@ class Thermocline(Generic[K, T]):
         self._cursor: str | None = None
         self._task: asyncio.Task[None] | None = None
         self._counters = _Counters()
+        self._inflight: dict[K, asyncio.Task[T | None]] = {}
         logger.debug("configured %r", self)
 
     def __repr__(self) -> str:
@@ -329,6 +342,7 @@ class Thermocline(Generic[K, T]):
             cold_hits=c.cold_hits,
             source_loads=c.source_loads,
             absent_served=c.absent_served,
+            coalesced=c.coalesced,
             probes=c.probes,
             stale_served=c.stale_served,
             sync_runs=c.sync_runs,
@@ -401,11 +415,78 @@ class Thermocline(Generic[K, T]):
             else _as_seconds(max_staleness, "max_staleness")
         )
         envelope = self._cold.get(key)
+        if envelope is not None:
+            if time.monotonic() - envelope.checked_at <= limit:
+                return self._serve(key, envelope)
+        else:
+            if (
+                self._sync_mode is not None
+                and self._last_sync is not None
+                and time.monotonic() - self._last_sync <= limit
+            ):
+                self._counters.absent_served += 1
+                return None
+            checked_at = self._tombstones.get(key)
+            if checked_at is not None and time.monotonic() - checked_at <= limit:
+                self._tombstones.move_to_end(key)
+                self._counters.absent_served += 1
+                return None
+        return await self._coalesced_slow(key, limit)
+
+    async def _coalesced_slow(self, key: K, limit: float) -> T | None:
+        """Run the source-touching path once per key, however many readers ask.
+
+        The first reader becomes the leader: the operation runs as a task
+        owned by the cache, so a cancelled leader does not take the flight
+        down with it. Late readers await the same task. A success is shared
+        as the result; a failure is shared as the exception, after which
+        every reader applies its *own* ``stale_grace`` to whatever copy it
+        still holds — the I/O is shared, the policy stays per-call.
+        """
+        existing = self._inflight.get(key)
+        if existing is not None:
+            try:
+                result = await asyncio.shield(existing)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                return self._absorb_shared_failure(key, limit, exc)
+            self._counters.coalesced += 1
+            return result
+        flight: asyncio.Task[T | None] = asyncio.create_task(self._resolve_slow(key, limit))
+        self._inflight[key] = flight
+        flight.add_done_callback(self._forget_flight(key))
+        return await asyncio.shield(flight)
+
+    def _forget_flight(self, key: K) -> Callable[[asyncio.Task[T | None]], None]:
+        def callback(flight: asyncio.Task[T | None]) -> None:
+            self._inflight.pop(key, None)
+            if not flight.cancelled():
+                flight.exception()  # abandoned by a cancelled leader: mark as retrieved
+
+        return callback
+
+    async def _resolve_slow(self, key: K, limit: float) -> T | None:
+        envelope = self._cold.get(key)
         if envelope is None:
             return await self._absent(key, limit)
         if time.monotonic() - envelope.checked_at <= limit:
-            return self._serve(key, envelope)
+            return self._serve(key, envelope)  # refreshed while we queued
         return await self._revalidate(key, envelope, limit)
+
+    def _absorb_shared_failure(self, key: K, limit: float, exc: BaseException) -> T | None:
+        envelope = self._cold.get(key)
+        if envelope is not None and self._within_grace(envelope, limit):
+            logger.debug("serving stale %r: shared flight failed within grace", key)
+            self._counters.stale_served += 1
+            return self._serve(key, envelope)
+        checked_at = self._tombstones.get(key)
+        if checked_at is not None and time.monotonic() - checked_at <= limit + self._stale_grace:
+            logger.debug("serving stale absence %r: shared flight failed within grace", key)
+            self._counters.stale_served += 1
+            self._counters.absent_served += 1
+            return None
+        raise exc  # the shared flight's failure is every joiner's failure
 
     def pin(self, key: K) -> None:
         """Exempt a key from eviction; pins consume ``hot_capacity``."""

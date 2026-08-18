@@ -520,3 +520,120 @@ class TestStats:
     async def test_repr_shows_hit_rate(self) -> None:
         cache = lazy_cache(BareSource())
         assert "hit_rate=" in repr(cache)
+
+
+class GatedSource(BareSource):
+    """Source whose get() blocks until the test opens the gate."""
+
+    def __init__(self, items: dict[int, Item] | None = None) -> None:
+        super().__init__(items)
+        self.gate = asyncio.Event()
+
+    async def get(self, key: int) -> Item | None:
+        self.get_calls += 1
+        await self.gate.wait()
+        return self.items.get(key)
+
+
+class TestSingleFlight:
+    async def test_concurrent_misses_share_one_source_call(self) -> None:
+        source = GatedSource({1: Item(1, "a")})
+        cache = lazy_cache(source, max_staleness=math.inf)
+        reads = [asyncio.create_task(cache.get(1)) for _ in range(10)]
+        await asyncio.sleep(0)  # let every reader reach the flight
+        source.gate.set()
+        results = await asyncio.gather(*reads)
+        assert source.get_calls == 1
+        assert all(r == Item(1, "a") for r in results)
+        assert len({id(r) for r in results}) == 1  # one shared live object
+        stats = cache.stats()
+        assert stats.coalesced == 9
+        assert stats.source_loads == 1
+        assert stats.reads == 10
+
+    async def test_concurrent_probes_coalesce(self) -> None:
+        class GatedProbeSource(ProbeSource):
+            def __init__(self, items: dict[int, Item] | None = None) -> None:
+                super().__init__(items)
+                self.gate = asyncio.Event()
+
+            async def get_hash(self, key: int) -> str | None:
+                self.probe_calls += 1
+                await self.gate.wait()
+                obj = self.items.get(key)
+                return None if obj is None else self.hash_of(obj)
+
+        source = GatedProbeSource({1: Item(1, "a")})
+        cache = lazy_cache(source)  # strict: probe every read
+        source.gate.set()
+        await cache.get(1)  # populate
+        source.gate.clear()
+        reads = [asyncio.create_task(cache.get(1)) for _ in range(10)]
+        for _ in range(3):
+            await asyncio.sleep(0)  # let the leader's flight task reach the probe
+        probes_before = source.probe_calls
+        source.gate.set()
+        results = await asyncio.gather(*reads)
+        assert probes_before == 1  # ten stale readers, one probe in flight
+        assert all(r == Item(1, "a") for r in results)
+        assert cache.stats().coalesced == 9
+
+    async def test_cancelled_leader_does_not_take_the_flight_down(self) -> None:
+        source = GatedSource({1: Item(1, "a")})
+        cache = lazy_cache(source, max_staleness=math.inf)
+        leader = asyncio.create_task(cache.get(1))
+        await asyncio.sleep(0)
+        follower = asyncio.create_task(cache.get(1))
+        await asyncio.sleep(0)
+        leader.cancel()
+        source.gate.set()
+        assert await follower == Item(1, "a")
+        with pytest.raises(asyncio.CancelledError):
+            await leader
+        assert source.get_calls == 1
+
+    async def test_shared_failure_reaches_every_reader(self) -> None:
+        class FailingGatedSource(GatedSource):
+            async def get(self, key: int) -> Item | None:
+                self.get_calls += 1
+                await self.gate.wait()
+                raise ConnectionError("db is down")
+
+        source = FailingGatedSource()
+        cache = lazy_cache(source, max_staleness=math.inf)
+        reads = [asyncio.create_task(cache.get(1)) for _ in range(3)]
+        await asyncio.sleep(0)
+        source.gate.set()
+        results = await asyncio.gather(*reads, return_exceptions=True)
+        assert all(isinstance(r, ConnectionError) for r in results)
+        assert source.get_calls == 1
+
+    async def test_shared_failure_with_personal_grace_serves_stale(self) -> None:
+        class FailingProbeGate(ProbeSource):
+            def __init__(self, items: dict[int, Item] | None = None) -> None:
+                super().__init__(items)
+                self.gate = asyncio.Event()
+
+            async def get_hash(self, key: int) -> str | None:
+                self.probe_calls += 1
+                await self.gate.wait()
+                raise ConnectionError("db is down")
+
+        source = FailingProbeGate({1: Item(1, "a")})
+        cache = lazy_cache(source, max_staleness=0, stale_grace=60)
+        source.gate.set()
+        first = await cache.get(1)  # populate via miss (probe not needed)
+        source.gate.clear()
+        reads = [asyncio.create_task(cache.get(1)) for _ in range(3)]
+        await asyncio.sleep(0)
+        source.gate.set()
+        results = await asyncio.gather(*reads)
+        assert all(r is first for r in results)  # all served the stale hot copy
+        assert cache.stats().stale_served >= 1
+
+    async def test_flight_registry_is_cleaned_up(self) -> None:
+        source = GatedSource({1: Item(1, "a")})
+        cache = lazy_cache(source, max_staleness=math.inf)
+        source.gate.set()
+        await cache.get(1)
+        assert cache._inflight == {}
