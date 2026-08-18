@@ -431,3 +431,92 @@ class TestAuthoritativeAbsence:
     def test_negative_capacity_rejected_with_sync(self) -> None:
         with pytest.raises(MisconfiguredCacheError, match="negative_capacity"):
             Thermocline(DeltaSource(), make_serializer(), hot_capacity=10, negative_capacity=5)
+
+
+class TestStats:
+    async def test_read_outcomes_are_partitioned(self) -> None:
+        source = BareSource({1: Item(1, "a")})
+        cache = lazy_cache(source, max_staleness=math.inf, hot_capacity=0)
+        await cache.get(1)  # miss -> source
+        await cache.get(1)  # cold hit (hot disabled)
+        stats = cache.stats()
+        assert (stats.source_loads, stats.cold_hits, stats.hot_hits) == (1, 1, 0)
+        assert stats.reads == 2
+
+    async def test_hot_hits_and_hit_rate(self) -> None:
+        source = BareSource({1: Item(1, "a")})
+        cache = lazy_cache(source, max_staleness=math.inf)
+        for _ in range(4):
+            await cache.get(1)
+        stats = cache.stats()
+        assert stats.hot_hits == 3
+        assert stats.hit_rate == 0.75
+
+    async def test_probe_counted_alongside_outcome(self) -> None:
+        source = ProbeSource({1: Item(1, "a")})
+        cache = lazy_cache(source)  # strict: probe every read
+        await cache.get(1)
+        await cache.get(1)
+        stats = cache.stats()
+        assert stats.probes == 1  # second read probed, first was a plain miss
+        assert stats.hot_hits == 1
+        assert stats.source_loads == 1
+
+    async def test_unchanged_reload_counts_as_source_load(self) -> None:
+        source = BareSource({1: Item(1, "a")})
+        cache = lazy_cache(source, max_staleness=0)  # strict without probe
+        await cache.get(1)
+        await cache.get(1)  # full reload, hash unchanged
+        stats = cache.stats()
+        assert stats.source_loads == 2
+        assert stats.hot_hits == 0  # a reload is not a memory hit
+        assert stats.hit_rate == 0.0
+
+    async def test_stale_served_is_visible(self) -> None:
+        source = ProbeSource({1: Item(1, "a")})
+        cache = lazy_cache(source, stale_grace=60)
+        await cache.get(1)
+        source.probe_error = ConnectionError("db is down")
+        await cache.get(1)
+        stats = cache.stats()
+        assert stats.stale_served == 1
+        assert stats.hot_hits == 1  # the stale serve still came from the hot tier
+
+    async def test_absent_served_from_tombstone(self) -> None:
+        source = BareSource()
+        cache = lazy_cache(source, max_staleness=math.inf, negative_capacity=10)
+        await cache.get(42)
+        await cache.get(42)
+        stats = cache.stats()
+        assert stats.absent_served == 1
+        assert stats.source_loads == 1
+
+    async def test_sync_counters_and_age(self) -> None:
+        source = DeltaSource()
+        source.batches = [SyncBatch(changed=[Item(1, "a")], deleted=[], cursor="c1")]
+        cache = Thermocline(source, make_serializer(), hot_capacity=10, max_staleness=math.inf)
+        assert cache.stats().last_sync_age is None
+        async with cache:
+            await cache.sync_now()
+            source.sync_error = ConnectionError("db is down")
+            with pytest.raises(ConnectionError):
+                await cache.sync_now()
+            stats = cache.stats()
+        assert stats.sync_runs == 2  # bootstrap + manual
+        assert stats.sync_failures == 1
+        assert stats.last_sync_age is not None and stats.last_sync_age >= 0
+
+    async def test_gauges_reflect_sizes(self) -> None:
+        source = BareSource({1: Item(1, "a"), 2: Item(2, "b")})
+        cache = lazy_cache(source, max_staleness=math.inf, negative_capacity=10)
+        await cache.get(1)
+        await cache.get(2)
+        await cache.get(404)
+        cache.pin(1)
+        stats = cache.stats()
+        assert (stats.hot_size, stats.cold_size, stats.tombstones, stats.pinned) == (2, 2, 1, 1)
+        assert stats.memory_bytes == cache.memory_bytes
+
+    async def test_repr_shows_hit_rate(self) -> None:
+        cache = lazy_cache(BareSource())
+        assert "hit_rate=" in repr(cache)

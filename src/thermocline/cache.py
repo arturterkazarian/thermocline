@@ -73,6 +73,77 @@ class _Envelope:
     checked_at: float
 
 
+@dataclass(slots=True)
+class _Counters:
+    hot_hits: int = 0
+    cold_hits: int = 0
+    source_loads: int = 0
+    absent_served: int = 0
+    probes: int = 0
+    stale_served: int = 0
+    sync_runs: int = 0
+    sync_failures: int = 0
+
+
+@dataclass(frozen=True)
+class CacheStats:
+    """One point-in-time snapshot of cache activity and sizes.
+
+    Counters are cumulative since the cache was constructed; every ``get``
+    that returns increments exactly one of ``hot_hits`` / ``cold_hits`` /
+    ``absent_served`` / ``source_loads`` by its final outcome.
+    ``stale_served`` and ``probes`` count *additionally*: a probe precedes
+    an outcome, and a stale serve under ``stale_grace`` is still a hot or
+    cold hit — watching ``stale_served`` grow is how source degradation
+    stays visible.
+
+    Attributes:
+        hot_hits: Reads served from the hot tier.
+        cold_hits: Reads deserialized from the cold tier (promotions).
+        source_loads: Successful full loads from the source.
+        absent_served: ``None`` answered from memory — a tombstone or an
+            authoritative synced cold tier.
+        probes: Freshness probes sent to the source.
+        stale_served: Reads served beyond ``max_staleness`` because the
+            source was unreachable within ``stale_grace``.
+        sync_runs: Successful synchronization cycles.
+        sync_failures: Synchronization cycles that raised.
+        last_sync_age: Seconds since the last successful sync, or ``None``
+            if no sync has completed.
+        hot_size: Live objects currently in the hot tier.
+        cold_size: Envelopes currently in the cold tier.
+        tombstones: Remembered absences.
+        pinned: Keys exempt from hot-tier eviction.
+        memory_bytes: Estimated cold-tier footprint, bytes.
+    """
+
+    hot_hits: int
+    cold_hits: int
+    source_loads: int
+    absent_served: int
+    probes: int
+    stale_served: int
+    sync_runs: int
+    sync_failures: int
+    last_sync_age: float | None
+    hot_size: int
+    cold_size: int
+    tombstones: int
+    pinned: int
+    memory_bytes: int
+
+    @property
+    def reads(self) -> int:
+        """Total reads that returned, whatever the outcome."""
+        return self.hot_hits + self.cold_hits + self.absent_served + self.source_loads
+
+    @property
+    def hit_rate(self) -> float:
+        """Share of reads answered from memory; ``0.0`` before any reads."""
+        served = self.hot_hits + self.cold_hits + self.absent_served
+        return served / self.reads if self.reads else 0.0
+
+
 class Thermocline(Generic[K, T]):
     """Tiered read-through cache over a :class:`CacheSource`.
 
@@ -214,6 +285,7 @@ class Thermocline(Generic[K, T]):
         self._pinned: set[K] = set()
         self._cursor: str | None = None
         self._task: asyncio.Task[None] | None = None
+        self._counters = _Counters()
         logger.debug("configured %r", self)
 
     def __repr__(self) -> str:
@@ -225,7 +297,8 @@ class Thermocline(Generic[K, T]):
         return (
             f"Thermocline(sync={sync}, max_staleness={staleness}, "
             f"stale_grace={self._stale_grace}, "
-            f"hot={len(self._hot)}/{self._hot_capacity}, cold={len(self._cold)})"
+            f"hot={len(self._hot)}/{self._hot_capacity}, cold={len(self._cold)}, "
+            f"hit_rate={self.stats().hit_rate:.2f})"
         )
 
     @property
@@ -247,6 +320,28 @@ class Thermocline(Generic[K, T]):
     def memory_bytes(self) -> int:
         """Estimated cold-tier footprint: payload bytes plus bookkeeping overhead."""
         return self._cold_bytes
+
+    def stats(self) -> CacheStats:
+        """Return a point-in-time :class:`CacheStats` snapshot. O(1)."""
+        c = self._counters
+        return CacheStats(
+            hot_hits=c.hot_hits,
+            cold_hits=c.cold_hits,
+            source_loads=c.source_loads,
+            absent_served=c.absent_served,
+            probes=c.probes,
+            stale_served=c.stale_served,
+            sync_runs=c.sync_runs,
+            sync_failures=c.sync_failures,
+            last_sync_age=(
+                time.monotonic() - self._last_sync if self._last_sync is not None else None
+            ),
+            hot_size=len(self._hot),
+            cold_size=len(self._cold),
+            tombstones=len(self._tombstones),
+            pinned=len(self._pinned),
+            memory_bytes=self._cold_bytes,
+        )
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -340,10 +435,17 @@ class Thermocline(Generic[K, T]):
         """
         if self._sync_mode is None:
             raise MisconfiguredCacheError("background sync is disabled (sync=None)")
-        if self._sync_mode == "delta":
-            await self._sync_delta()
-        else:
-            await self._sync_snapshot()
+        try:
+            if self._sync_mode == "delta":
+                await self._sync_delta()
+            else:
+                await self._sync_snapshot()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._counters.sync_failures += 1
+            raise
+        self._counters.sync_runs += 1
         self._last_sync = time.monotonic()
 
     async def _sync_loop(self) -> None:
@@ -405,13 +507,17 @@ class Thermocline(Generic[K, T]):
 
     # -- internals ---------------------------------------------------------
 
-    def _serve(self, key: K, envelope: _Envelope) -> T | None:
+    def _serve(self, key: K, envelope: _Envelope, *, count: bool = True) -> T | None:
         self._cold.move_to_end(key)
         obj = self._hot.get(key)
         if obj is not None:
+            if count:
+                self._counters.hot_hits += 1
             if key not in self._pinned:
                 self._evictor.on_access(key)
             return obj
+        if count:
+            self._counters.cold_hits += 1
         obj = self._serializer.decode(envelope.payload)
         self._admit(key, obj)
         return obj
@@ -487,6 +593,7 @@ class Thermocline(Generic[K, T]):
         if self._sync_mode is not None:
             # a complete cold tier is authoritative: absence is as fresh as the last sync
             if self._last_sync is not None and time.monotonic() - self._last_sync <= limit:
+                self._counters.absent_served += 1
                 return None
             return await self._load_miss(key)
         checked_at = self._tombstones.get(key)
@@ -494,11 +601,13 @@ class Thermocline(Generic[K, T]):
             return await self._load_miss(key)
         if time.monotonic() - checked_at <= limit:
             self._tombstones.move_to_end(key)
+            self._counters.absent_served += 1
             return None
         return await self._revalidate_absent(key, checked_at, limit)
 
     async def _revalidate_absent(self, key: K, checked_at: float, limit: float) -> T | None:
         if self._probe is not None:
+            self._counters.probes += 1
             try:
                 current = await self._probe(key)
             except asyncio.CancelledError:
@@ -506,10 +615,13 @@ class Thermocline(Generic[K, T]):
             except Exception:
                 if time.monotonic() - checked_at <= limit + self._stale_grace:
                     logger.debug("serving stale absence %r: probe failed within grace", key)
+                    self._counters.stale_served += 1
+                    self._counters.absent_served += 1
                     return None
                 raise
             if current is None:
                 self._remember_absent(key)
+                self._counters.absent_served += 1
                 return None
             return await self._load_miss(key)  # the object came into existence
         try:
@@ -519,8 +631,11 @@ class Thermocline(Generic[K, T]):
         except Exception:
             if time.monotonic() - checked_at <= limit + self._stale_grace:
                 logger.debug("serving stale absence %r: reload failed within grace", key)
+                self._counters.stale_served += 1
+                self._counters.absent_served += 1
                 return None
             raise
+        self._counters.source_loads += 1
         if obj is None:
             self._remember_absent(key)
             return None
@@ -529,6 +644,7 @@ class Thermocline(Generic[K, T]):
 
     async def _load_miss(self, key: K) -> T | None:
         obj = await self._source.get(key)  # no cached copy: errors propagate
+        self._counters.source_loads += 1
         if obj is None:
             self._remember_absent(key)
             return None
@@ -550,6 +666,7 @@ class Thermocline(Generic[K, T]):
     async def _revalidate(self, key: K, envelope: _Envelope, limit: float) -> T | None:
         if self._probe is None:
             return await self._reload(key, envelope, limit)
+        self._counters.probes += 1
         try:
             current = await self._probe(key)
         except asyncio.CancelledError:
@@ -557,6 +674,7 @@ class Thermocline(Generic[K, T]):
         except Exception:
             if self._within_grace(envelope, limit):
                 logger.debug("serving stale %r: freshness probe failed within grace", key)
+                self._counters.stale_served += 1
                 return self._serve(key, envelope)
             raise
         if current is None:
@@ -575,13 +693,16 @@ class Thermocline(Generic[K, T]):
         except Exception:
             if self._within_grace(envelope, limit):
                 logger.debug("serving stale %r: reload failed within grace", key)
+                self._counters.stale_served += 1
                 return self._serve(key, envelope)
             raise
+        self._counters.source_loads += 1
         if obj is None:
             self._delete_entry(key)
             return None
         if self._source.hash_of(obj) == envelope.hash:
             envelope.checked_at = time.monotonic()
-            return self._serve(key, envelope)  # unchanged: keep the hot identity
+            # unchanged: keep the hot identity; the outcome is the source load
+            return self._serve(key, envelope, count=False)
         self._store(key, obj)
         return obj
