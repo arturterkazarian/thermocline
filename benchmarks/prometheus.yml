@@ -1,0 +1,8 @@
+global:
+  scrape_interval: 1s
+  scrape_timeout: 900ms
+
+scrape_configs:
+  - job_name: thermocline-bench
+    static_configs:
+      - targets: ["host.docker.internal:8099"]

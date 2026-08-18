@@ -1,9 +1,9 @@
 """Thermocline benchmark harness: every adapter, with and without the cache.
 
 Usage:
-    uv run --with asyncpg --with psutil --with matplotlib python benchmarks/bench.py
-        [--requests 5000] [--concurrency 50] [--keys 10000]
-        [--adapters sqlalchemy,tortoise,aiosql,httpx] [--modes ...]
+    uv run --with asyncpg --with psutil --with matplotlib --with prometheus-client
+        python benchmarks/bench.py [--requests 5000] [--concurrency 50]
+        [--adapters ...] [--modes ...] [--seconds 15] [--metrics-port 8099]
 
 Modes per adapter:
     nocache       -- every get() goes straight to the source
@@ -57,6 +57,81 @@ PG_TORTOISE = "postgres://bench:bench@localhost:5433/bench"
 PG_ASYNCPG = "postgresql://bench:bench@localhost:5433/bench"
 API = "http://localhost:8077"
 RESULTS = pathlib.Path(__file__).parent / "results"
+
+
+# -- prometheus metrics (optional) ------------------------------------------
+class Metrics:
+    """Prometheus exporters: bench progress plus CacheStats deltas."""
+
+    def __init__(self, port: int) -> None:
+        from prometheus_client import Counter, Gauge, Histogram, start_http_server
+
+        start_http_server(port)
+        labels = ["adapter", "mode"]
+        self.requests = Counter("bench_requests_total", "requests completed", labels)
+        self.latency = Histogram(
+            "bench_request_seconds",
+            "request latency",
+            labels,
+            buckets=(1e-5, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0),
+        )
+        self.reads = Counter("thermocline_reads_total", "reads by outcome", [*labels, "outcome"])
+        self.probes = Counter("thermocline_probes_total", "probes sent", labels)
+        self.stale = Counter("thermocline_stale_served_total", "stale serves", labels)
+        self.coalesced = Counter("thermocline_coalesced_total", "coalesced reads", labels)
+        self.hot = Gauge("thermocline_hot_size", "hot tier size", labels)
+        self.cold = Gauge("thermocline_cold_size", "cold tier size", labels)
+        self.tombs = Gauge("thermocline_tombstones", "tombstones", labels)
+        self.memory = Gauge("thermocline_memory_bytes", "cold tier bytes", labels)
+        self.sync_age = Gauge("thermocline_last_sync_age_seconds", "sync age", labels)
+
+
+class StatsPublisher:
+    """Polls cache.stats() and republishes deltas as Prometheus series."""
+
+    def __init__(self, metrics: Metrics, cache: Any, adapter: str, mode: str) -> None:
+        self._metrics = metrics
+        self._cache = cache
+        self._labels = (adapter, mode)
+        self._prev = cache.stats()
+        self._task: asyncio.Task[None] | None = None
+
+    def _publish(self) -> None:
+        m, (adapter, mode) = self._metrics, self._labels
+        stats, prev = self._cache.stats(), self._prev
+        for outcome, now_v, prev_v in (
+            ("hot", stats.hot_hits, prev.hot_hits),
+            ("cold", stats.cold_hits, prev.cold_hits),
+            ("absent", stats.absent_served, prev.absent_served),
+            ("source", stats.source_loads, prev.source_loads),
+            ("coalesced", stats.coalesced, prev.coalesced),
+        ):
+            m.reads.labels(adapter, mode, outcome).inc(now_v - prev_v)
+        m.probes.labels(adapter, mode).inc(stats.probes - prev.probes)
+        m.stale.labels(adapter, mode).inc(stats.stale_served - prev.stale_served)
+        m.coalesced.labels(adapter, mode).inc(stats.coalesced - prev.coalesced)
+        m.hot.labels(adapter, mode).set(stats.hot_size)
+        m.cold.labels(adapter, mode).set(stats.cold_size)
+        m.tombs.labels(adapter, mode).set(stats.tombstones)
+        m.memory.labels(adapter, mode).set(stats.memory_bytes)
+        if stats.last_sync_age is not None:
+            m.sync_age.labels(adapter, mode).set(stats.last_sync_age)
+        self._prev = stats
+
+    async def _loop(self) -> None:
+        while True:
+            self._publish()
+            await asyncio.sleep(0.2)
+
+    def start(self) -> None:
+        self._task = asyncio.create_task(self._loop())
+
+    async def stop(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+            self._publish()
 
 
 # -- sqlalchemy mapping ----------------------------------------------------
@@ -300,7 +375,14 @@ class Result:
     mem_mb: float
 
 
-async def measure(target: Any, workload: list[int], concurrency: int) -> tuple[float, ...]:
+async def measure(
+    target: Any,
+    workload: list[int],
+    concurrency: int,
+    seconds: float | None = None,
+    bench_counter: Any = None,
+    bench_latency: Any = None,
+) -> tuple[float, ...]:
     latencies: list[float] = []
     semaphore = asyncio.Semaphore(concurrency)
 
@@ -308,17 +390,23 @@ async def measure(target: Any, workload: list[int], concurrency: int) -> tuple[f
         async with semaphore:
             t0 = time.perf_counter()
             await target(key)
-            latencies.append(time.perf_counter() - t0)
+            dt = time.perf_counter() - t0
+            latencies.append(dt)
+            if bench_counter is not None:
+                bench_counter.inc()
+                bench_latency.observe(dt)
 
     t0 = time.perf_counter()
     await asyncio.gather(*(one(k) for k in workload))
+    while seconds is not None and time.perf_counter() - t0 < seconds:
+        await asyncio.gather(*(one(k) for k in workload))
     wall = time.perf_counter() - t0
     latencies.sort()
 
     def pct(p: float) -> float:
         return latencies[min(len(latencies) - 1, int(p * len(latencies)))] * 1000
 
-    return (len(workload) / wall, pct(0.50), pct(0.95), pct(0.99))
+    return (len(latencies) / wall, pct(0.50), pct(0.95), pct(0.99))
 
 
 async def run_case(
@@ -327,22 +415,36 @@ async def run_case(
     workload: list[int],
     concurrency: int,
     sampler: MemorySampler,
+    seconds: float | None = None,
+    metrics: Metrics | None = None,
 ) -> Result:
     probe = mode != "strict_reload"
     source, serializer, aclose = await BACKENDS[name](probe)
+    bench_counter = metrics.requests.labels(name, mode) if metrics else None
+    bench_latency = metrics.latency.labels(name, mode) if metrics else None
+    publisher: StatsPublisher | None = None
     try:
         case_start = sampler.mark(f"{name}/{mode}")
         if mode == "nocache":
-            stats = await measure(source.get, workload, concurrency)
+            stats = await measure(
+                source.get, workload, concurrency, seconds, bench_counter, bench_latency
+            )
         else:
             cache = Thermocline(source, serializer, hot_capacity=2_000, **MODE_CACHE_CONFIG[mode])
+            if metrics is not None:
+                publisher = StatsPublisher(metrics, cache, name, mode)
+                publisher.start()
             async with cache:
                 if mode != "sync":  # lazy modes: warm up so we measure steady state
                     for key in set(workload):
                         await cache.get(key)
-                stats = await measure(cache.get, workload, concurrency)
+                stats = await measure(
+                    cache.get, workload, concurrency, seconds, bench_counter, bench_latency
+                )
         case_end = time.perf_counter()
     finally:
+        if publisher is not None:
+            await publisher.stop()
         await aclose()
     gc.collect()
     await asyncio.sleep(0.1)  # let RSS settle before the next case
@@ -356,8 +458,21 @@ async def main() -> None:
     parser.add_argument("--keys", type=int, default=10_000)
     parser.add_argument("--adapters", default="sqlalchemy,tortoise,aiosql,httpx")
     parser.add_argument("--modes", default="nocache,strict_probe,strict_reload,ttl,sync")
+    parser.add_argument(
+        "--seconds",
+        type=float,
+        default=None,
+        help="hold each case under load for N seconds (for watching live metrics)",
+    )
+    parser.add_argument(
+        "--metrics-port",
+        type=int,
+        default=0,
+        help="expose Prometheus metrics on this port (0 = off)",
+    )
     args = parser.parse_args()
 
+    metrics = Metrics(args.metrics_port) if args.metrics_port else None
     workload = make_workload(args.keys, args.requests)
     sampler = MemorySampler()
     sampler.start()
@@ -366,7 +481,9 @@ async def main() -> None:
     for name in args.adapters.split(","):
         print(f"[{name}]")
         for mode in args.modes.split(","):
-            result = await run_case(name, mode, workload, args.concurrency, sampler)
+            result = await run_case(
+                name, mode, workload, args.concurrency, sampler, args.seconds, metrics
+            )
             all_results[(name, mode)] = result
             print(
                 f"  {mode}: {result.ops:,.0f} ops/s  p50={result.p50:.2f}ms "

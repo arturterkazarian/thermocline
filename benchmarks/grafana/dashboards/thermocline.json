@@ -1,0 +1,371 @@
+{
+ "uid": "thermocline",
+ "title": "Thermocline Benchmarks",
+ "timezone": "browser",
+ "refresh": "1s",
+ "time": {
+  "from": "now-10m",
+  "to": "now"
+ },
+ "schemaVersion": 39,
+ "panels": [
+  {
+   "type": "timeseries",
+   "title": "Throughput, ops/s",
+   "gridPos": {
+    "x": 0,
+    "y": 0,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "lineWidth": 2,
+      "fillOpacity": 12,
+      "spanNulls": true
+     },
+     "unit": "ops"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "expr": "sum by (adapter, mode) (rate(bench_requests_total[5s]))",
+     "legendFormat": "{{adapter}}/{{mode}}",
+     "refId": "A"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Latency quantiles",
+   "gridPos": {
+    "x": 12,
+    "y": 0,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "lineWidth": 2,
+      "fillOpacity": 12,
+      "spanNulls": true
+     },
+     "unit": "s"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "expr": "histogram_quantile(0.50, sum by (le) (rate(bench_request_seconds_bucket[10s])))",
+     "legendFormat": "p50",
+     "refId": "A"
+    },
+    {
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(bench_request_seconds_bucket[10s])))",
+     "legendFormat": "p99",
+     "refId": "B"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Reads by outcome, /s",
+   "gridPos": {
+    "x": 0,
+    "y": 8,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "lineWidth": 2,
+      "fillOpacity": 12,
+      "spanNulls": true
+     },
+     "unit": "ops"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "expr": "sum by (outcome) (rate(thermocline_reads_total[5s]))",
+     "legendFormat": "{{outcome}}",
+     "refId": "A"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Hit rate",
+   "gridPos": {
+    "x": 12,
+    "y": 8,
+    "w": 6,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percentunit",
+     "min": 0,
+     "max": 1,
+     "custom": {
+      "lineWidth": 2,
+      "fillOpacity": 25,
+      "spanNulls": true
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "expr": "1 - (sum(rate(thermocline_reads_total{outcome=\"source\"}[10s])) / sum(rate(thermocline_reads_total[10s])))",
+     "legendFormat": "hit rate",
+     "refId": "A"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Source pressure, /s",
+   "gridPos": {
+    "x": 18,
+    "y": 8,
+    "w": 6,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "lineWidth": 2,
+      "fillOpacity": 12,
+      "spanNulls": true
+     },
+     "unit": "ops"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "expr": "sum(rate(thermocline_reads_total{outcome=\"source\"}[5s]))",
+     "legendFormat": "source loads",
+     "refId": "A"
+    },
+    {
+     "expr": "sum(rate(thermocline_probes_total[5s]))",
+     "legendFormat": "probes",
+     "refId": "B"
+    },
+    {
+     "expr": "sum(rate(thermocline_coalesced_total[5s]))",
+     "legendFormat": "coalesced (saved)",
+     "refId": "C"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Cold-tier memory",
+   "gridPos": {
+    "x": 0,
+    "y": 16,
+    "w": 8,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "lineWidth": 2,
+      "fillOpacity": 12,
+      "spanNulls": true
+     },
+     "unit": "bytes"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "expr": "sum by (adapter, mode) (thermocline_memory_bytes)",
+     "legendFormat": "{{adapter}}/{{mode}}",
+     "refId": "A"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Tier sizes",
+   "gridPos": {
+    "x": 8,
+    "y": 16,
+    "w": 8,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "lineWidth": 2,
+      "fillOpacity": 12,
+      "spanNulls": true
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "expr": "sum(thermocline_hot_size)",
+     "legendFormat": "hot",
+     "refId": "A"
+    },
+    {
+     "expr": "sum(thermocline_cold_size)",
+     "legendFormat": "cold",
+     "refId": "B"
+    },
+    {
+     "expr": "sum(thermocline_tombstones)",
+     "legendFormat": "tombstones",
+     "refId": "C"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Degradation & sync",
+   "gridPos": {
+    "x": 16,
+    "y": 16,
+    "w": 8,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "lineWidth": 2,
+      "fillOpacity": 12,
+      "spanNulls": true
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "expr": "sum(rate(thermocline_stale_served_total[5s]))",
+     "legendFormat": "stale served /s",
+     "refId": "A"
+    },
+    {
+     "expr": "max(thermocline_last_sync_age_seconds)",
+     "legendFormat": "last sync age, s",
+     "refId": "B"
+    }
+   ]
+  }
+ ]
+}
