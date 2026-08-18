@@ -1,6 +1,6 @@
 [project]
 name = "thermocline"
-version = "0.1.0"
+version = "0.1.0b1"
 description = "A memory-efficient, tiered read-through cache for read-heavy Python services - hot objects over a compact cold tier, backed by any source."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -24,7 +24,7 @@ keywords = [
     "msgpack",
 ]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Framework :: AsyncIO",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3.10",

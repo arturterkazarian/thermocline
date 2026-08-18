@@ -277,17 +277,15 @@ Every read that returns counts toward exactly one outcome (`hot_hits` / `cold_hi
 
 ## Installation
 
-Not yet published to PyPI. From source:
-
 ```bash
-pip install "thermocline @ git+https://github.com/arturterkazarian/thermocline"
+pip install thermocline
 ```
 
 Optional extras: `thermocline[msgpack]` for the compact cold-tier codec; `thermocline[sqlalchemy]`, `thermocline[tortoise]`, `thermocline[aiosql]`, `thermocline[httpx]`, `thermocline[pydantic]` for the adapters.
 
 ## Status
 
-Alpha. The source contract, serializers, the two-tier cache facade, and five adapters (SQLAlchemy, Tortoise ORM, aiosql, httpx, Pydantic) are implemented and tested across Python 3.10–3.14. On the roadmap: metrics and observability, batch reads (`get_many`), a raw-payload fast path for bulk sync, and push-based invalidation.
+Beta. The source contract, serializers, the two-tier cache facade, five adapters (SQLAlchemy, Tortoise ORM, aiosql, httpx, Pydantic), single-flight stampede protection, memory bounding, and `stats()` observability are implemented and tested across Python 3.10–3.14, with a reproducible benchmark stand in [`benchmarks/`](benchmarks/). The public API may still change before 1.0. On the roadmap: batch reads (`get_many`), a raw-payload fast path for bulk sync, push-based invalidation, and thread-safety beyond asyncio.
 
 ## License
 
