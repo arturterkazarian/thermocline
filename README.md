@@ -249,6 +249,22 @@ cache = Thermocline(
 
 `memory_limit` bounds what is honestly measurable — the compact payloads. On overflow the cache evicts tombstones first, then the least recently used envelopes; an envelope with a hot copy goes last and takes it along. `negative_capacity` opts into negative caching: absences obey the same freshness rules as objects, and a bounded budget means a scan of random keys cannot grow memory without limit. Both dials are lazy-mode only — a synced cold tier holds the full dataset by design and needs neither.
 
+## Observability
+
+`cache.stats()` returns a point-in-time snapshot — cumulative counters plus size gauges, O(1), no dependencies. Feed it to whatever metrics system you use:
+
+```python
+stats = cache.stats()
+stats.hit_rate  # share of reads answered from memory
+stats.hot_hits, stats.cold_hits, stats.source_loads, stats.absent_served
+stats.probes  # freshness probes sent
+stats.stale_served  # reads served beyond max_staleness while the source was down
+stats.sync_runs, stats.sync_failures, stats.last_sync_age
+stats.hot_size, stats.cold_size, stats.tombstones, stats.pinned, stats.memory_bytes
+```
+
+Every read that returns counts toward exactly one outcome (`hot_hits` / `cold_hits` / `absent_served` / `source_loads`); `probes` and `stale_served` count on top. A growing `stale_served` is the visible trace of degradation under `stale_grace`; `last_sync_age` answers "how far behind am I" in the sync modes.
+
 ## Design principles
 
 - **No silent fallbacks.** Misconfiguration fails at construction with `MisconfiguredCacheError`; `auto` resolutions are visible in `repr(cache)` and properties.
