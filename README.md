@@ -1,5 +1,6 @@
 # thermocline
 
+[![PyPI](https://img.shields.io/pypi/v/thermocline)](https://pypi.org/project/thermocline/)
 [![CI](https://github.com/arturterkazarian/thermocline/actions/workflows/ci.yml/badge.svg)](https://github.com/arturterkazarian/thermocline/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.10%E2%80%933.14-blue)](https://github.com/arturterkazarian/thermocline/blob/main/pyproject.toml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
