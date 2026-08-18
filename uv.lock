@@ -801,7 +801,7 @@ asyncio = [
 
 [[package]]
 name = "thermocline"
-version = "0.1.0"
+version = "0.1.0b1"
 source = { editable = "." }
 
 [package.optional-dependencies]
