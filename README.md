@@ -257,6 +257,7 @@ cache = Thermocline(
 stats = cache.stats()
 stats.hit_rate  # share of reads answered from memory
 stats.hot_hits, stats.cold_hits, stats.source_loads, stats.absent_served
+stats.coalesced  # reads that joined another read's in-flight source call
 stats.probes  # freshness probes sent
 stats.stale_served  # reads served beyond max_staleness while the source was down
 stats.sync_runs, stats.sync_failures, stats.last_sync_age
@@ -267,6 +268,7 @@ Every read that returns counts toward exactly one outcome (`hot_hits` / `cold_hi
 
 ## Design principles
 
+- **The cache never amplifies load.** Concurrent misses and revalidations of one key coalesce into a single source operation (single-flight, always on): a cold start under traffic sends one query per key, not one per reader.
 - **No silent fallbacks.** Misconfiguration fails at construction with `MisconfiguredCacheError`; `auto` resolutions are visible in `repr(cache)` and properties.
 - **Your errors stay yours.** A failing source raises its own exception through the cache, unwrapped.
 - **Deletions can't be ignored.** Sync delivers them as keys, probes report them as `None` — a deleted object never masquerades as a live one.
